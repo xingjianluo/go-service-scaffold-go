@@ -1,0 +1,6 @@
+{
+  "service.name": "demo",
+  "db.password": "change-me",
+  "server.port": 8080,
+  "feature.enabled": false
+}
