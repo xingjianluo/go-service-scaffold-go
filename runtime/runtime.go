@@ -90,6 +90,10 @@ func (k FailureKind) String() string {
 		return "reload_build_failed"
 	case ReloadTimeout:
 		return "reload_timeout"
+	case ReloadCapacityExceeded:
+		return "reload_capacity_exceeded"
+	case ReloadShuttingDown:
+		return "reload_shutting_down"
 	default:
 		return "reload_unknown"
 	}

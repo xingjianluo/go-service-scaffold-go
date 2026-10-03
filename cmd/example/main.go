@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/xingjianluo/go-service-scaffold-go/app"
 	"github.com/xingjianluo/go-service-scaffold-go/config"
@@ -86,9 +87,19 @@ func buildSnapshot(ctx context.Context, cfg *config.Config) (*runtime.Snapshot, 
 
 func main() {
 	cfgPath := flag.String("config", "configs/example.json", "path to JSON config file")
+	// Retirement settings for the new generation/lease lifecycle:
+	maxRetired := flag.Int("max-retired", 4, "max displaced generations kept for in-flight requests")
+	drain := flag.Duration("shutdown-drain", 5*time.Second, "grace period Shutdown waits for in-flight requests")
 	flag.Parse()
 
-	application := app.New(config.NewLoader(schema(), *cfgPath, "APP"), buildSnapshot)
+	// WithGenerationRetirement turns on lease-based in-flight protection:
+	// every request Acquires a lease, works against one immutable generation,
+	// and Releases it; an old generation is closed only after its last lease.
+	application := app.New(
+		config.NewLoader(schema(), *cfgPath, "APP"),
+		buildSnapshot,
+		app.WithGenerationRetirement(*maxRetired, *drain),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -100,14 +111,42 @@ func main() {
 	log.Printf("booted; effective configuration:\n%s", snap.Config.Describe(schema()))
 	log.Printf("active plugins in init order: %v", pluginNames(snap))
 
+	// Canonical read lifecycle under generation retirement:
+	//
+	//	lease, err := application.Acquire()   // pin the CURRENT generation
+	//	defer lease.Release()                  // keep config+plugins consistent
+	//	s := lease.Snapshot()                  // ...use for the whole request...
+	//
+	// Even if a reload swaps generations mid-request, this request keeps the
+	// exact old config AND old plugins until Release; new requests immediately
+	// see the new generation.
+	handleRequest := func(tag string) {
+		lease, err := application.Acquire()
+		if err != nil {
+			log.Printf("[%s] acquire failed: %v", tag, err)
+			return
+		}
+		defer lease.Release()
+		s := lease.Snapshot()
+		log.Printf("[%s] serving on generation v%d plugins=%v",
+			tag, lease.GenerationID(), pluginNames(s))
+	}
+	handleRequest("before-reload")
+
 	// In a real service you would call application.Reload(ctx) from an HTTP
-	// handler or SIGHUP. The scaffold guarantees readers never see a partial
-	// state and that failed reloads keep serving the old snapshot.
+	// handler or SIGHUP. Failed reloads keep serving the old snapshot; when too
+	// many old generations are still in use, Reload returns a distinguishable
+	// *runtime.ReloadError with Kind=ReloadCapacityExceeded.
 	_ = application.Reload
 
+	// Observable generation/reload state.
+	st := application.RuntimeStatus()
+	log.Printf("runtime status: active=v%d reloading=%t retired=%d/%d",
+		st.ActiveID, st.Reloading, st.CapacityUsed, st.Capacity)
+
 	<-ctx.Done()
-	log.Print("shutdown signal received")
-	if err := application.Shutdown(); err != nil {
+	log.Print("shutdown signal received; draining in-flight requests up to " + drain.String())
+	if err := application.ShutdownCtx(ctx); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
 }
