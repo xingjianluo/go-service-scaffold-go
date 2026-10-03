@@ -100,9 +100,18 @@ func main() {
 	log.Printf("booted; effective configuration:\n%s", snap.Config.Describe(schema()))
 	log.Printf("active plugins in init order: %v", pluginNames(snap))
 
-	// In a real service you would call application.Reload(ctx) from an HTTP
-	// handler or SIGHUP. The scaffold guarantees readers never see a partial
-	// state and that failed reloads keep serving the old snapshot.
+	// In a real request handler, pin one generation for the whole request so a
+	// concurrent reload cannot swap config/plugins out from under it:
+	//
+	//	lease := application.Acquire()
+	//	defer lease.Release()
+	//	snap := lease.Snapshot() // stays complete and open until Release
+	//
+	// Reload failures keep serving the old generation; when the retained-
+	// generation capacity is full, Reload returns runtime.ReloadDrainFull
+	// instead of closing any in-use generation. Inspect application.RuntimeStatus()
+	// for the active version, in-progress reload, retained (draining/stuck)
+	// generations and their reclamation outcomes.
 	_ = application.Reload
 
 	<-ctx.Done()

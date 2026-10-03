@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/xingjianluo/go-service-scaffold-go/config"
 	"github.com/xingjianluo/go-service-scaffold-go/plugin"
@@ -349,5 +350,120 @@ func TestConcurrentReadsDuringReload(t *testing.T) {
 		a.Snapshot().Config.GetInt("server.port"))
 	if err := a.Shutdown(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestAppLeaseSurvivesReload is the end-to-end version of the runtime lease
+// guarantee: work started on the old generation finishes against the old
+// plugins even though reload swapped in a new generation; new work sees the
+// new state immediately.
+func TestAppLeaseSurvivesReload(t *testing.T) {
+	path := writeAppConfig(t, "svc", 8080, "pw1")
+	a := NewWithOptions(config.NewLoader(appSchema(), path, "APP"),
+		newBuild(t, -1, &orderTracker{}), Options{
+			MaxRetainedGenerations: 2,
+			DrainTimeout:           time.Second,
+			ShutdownWait:           time.Second,
+		})
+	if err := a.Boot(context.Background()); err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+
+	// Request A starts before reload on v1.
+	leaseA := a.Acquire()
+	if leaseA == nil {
+		t.Fatal("Acquire after boot must succeed")
+	}
+	oldB := leaseA.Snapshot().Plugins[1].(*lifecyclePlugin)
+
+	if err := os.WriteFile(path, []byte(
+		`{"service.name":"svc","db.password":"pw2","server.port":9090}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	// New request B immediately observes the new generation.
+	leaseB := a.Acquire()
+	if leaseB.Snapshot().Config.GetInt("server.port") != 9090 {
+		t.Fatalf("new work must see new port, got %d",
+			leaseB.Snapshot().Config.GetInt("server.port"))
+	}
+	// A still owns a complete old generation; its plugin is not closed.
+	if oldB.isClosed() {
+		t.Fatal("old plugin must remain open for in-flight request A")
+	}
+	if port := leaseA.Snapshot().Config.GetInt("server.port"); port != 8080 {
+		t.Fatalf("request A must keep seeing old port 8080, got %d", port)
+	}
+	st := a.RuntimeStatus()
+	log.Printf("INPUT request A leased v1, reload to v2, request B arrives\n"+
+		"JUDGEMENT active=v%d retained=%d A_port=%d B_port=%d oldPluginOpen=%t",
+		st.ActiveVersion, len(st.Retained),
+		leaseA.Snapshot().Config.GetInt("server.port"),
+		leaseB.Snapshot().Config.GetInt("server.port"), !oldB.isClosed())
+
+	leaseB.Release()
+	leaseA.Release()
+	// After A finishes, the old generation is reclaimed.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if oldB.isClosed() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !oldB.isClosed() {
+		t.Fatal("old generation must be closed after request A released its lease")
+	}
+	if err := a.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// TestAppReloadRejectedAtCapacity verifies the facade surfaces ReloadDrainFull
+// and keeps every in-use generation intact.
+func TestAppReloadRejectedAtCapacity(t *testing.T) {
+	path := writeAppConfig(t, "svc", 8080, "pw")
+	a := NewWithOptions(config.NewLoader(appSchema(), path, "APP"),
+		newBuild(t, -1, &orderTracker{}), Options{
+			MaxRetainedGenerations: 1,
+			DrainTimeout:           10 * time.Second,
+			ShutdownWait:           100 * time.Millisecond,
+		})
+	if err := a.Boot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	l1 := a.Acquire()
+	oldB := l1.Snapshot().Plugins[1].(*lifecyclePlugin)
+	writePort := func(p int) {
+		if err := os.WriteFile(path, []byte(fmt.Sprintf(
+			`{"service.name":"svc","db.password":"pw","server.port":%d}`, p)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePort(9090)
+	if err := a.Reload(context.Background()); err != nil {
+		t.Fatalf("first reload: %v", err)
+	}
+	writePort(9091)
+	err := a.Reload(context.Background())
+	var re *runtime.ReloadError
+	if !errors.As(err, &re) || re.Kind != runtime.ReloadDrainFull {
+		t.Fatalf("expected ReloadDrainFull, got %v", err)
+	}
+	log.Printf("INPUT app capacity=1, v1 still leased, attempted third generation\n"+
+		"JUDGEMENT reload rejected kind=%s; active port=%d; old plugin open=%t",
+		re.Kind, a.Snapshot().Config.GetInt("server.port"), !oldB.isClosed())
+	if a.Snapshot().Config.GetInt("server.port") != 9090 {
+		t.Fatal("active generation must remain v2 (9090)")
+	}
+	if oldB.isClosed() {
+		t.Fatal("leased v1 plugins must not be removed at capacity")
+	}
+	l1.Release()
+	if err := a.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 }

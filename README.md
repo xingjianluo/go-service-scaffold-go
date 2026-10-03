@@ -9,8 +9,8 @@
 | --- | --- |
 | `config` | 分层配置合并、类型校验、必填校验、取值校验、密钥脱敏、来源可解释 |
 | `plugin` | 插件注册、依赖拓扑排序、按序初始化、失败回滚、逆序关闭 |
-| `runtime` | 原子快照（`atomic.Pointer`）、热重载、失败保留旧状态 |
-| `app` | 门面：把三者串成 `Boot → Reload* → Shutdown` 的确定流程 |
+| `runtime` | 原子快照（`atomic.Pointer`）、热重载、失败保留旧状态、**代际租约与按租约回收、容量拒绝、可观测状态** |
+| `app` | 门面：把三者串成 `Boot → Reload* → Shutdown` 的确定流程，提供 `Acquire/Release` 固定一整代 |
 | `cmd/example` | 可运行的最小示例服务 |
 
 ## 一分钟上手
@@ -94,43 +94,115 @@ type Plugin interface {
 - **关闭**：`Manager.Close` 按启动逆序关闭，收集所有关闭错误为一个
   `PluginCloseFailed`，不会在第一个错误处中断；重复调用安全。
 
-## 热重载规则
+## 热重载与读取生命周期
 
-`runtime.Holder` 内部是一个 `atomic.Pointer[Snapshot]`，`Snapshot` 是
-"`*config.Config` + `[]plugin.Plugin`" 的不可变一代：
+脚手架在原有"原子快照"之上提供**代际（generation）+ 租约（lease）**层。
+`runtime.Manager` 每次成功重载发布一个带版本号的新代；业务每个处理单元
+（一个请求、一次任务）通过 `app.Acquire()` **固定**当前代，用完 `Release()`。
 
-1. **先建后换**：`Reloader.Reload` 先调用 `BuildFunc` 构建并初始化新一代；
-   构建期间旧快照继续对外服务。
-2. **失败保留旧状态**：构建返回 error（或 context 取消）时不触碰旧快照，
-   返回 `*runtime.ReloadError`，其 `OldKept=true` 且 Kind 可区分：
-   `ReloadBuildFailed`（构建失败）/ `ReloadTimeout`（context 取消/超时）。
-3. **原子发布**：构建成功后执行**唯一一次**指针 `Swap`。并发读取方
-   要么看到完整旧快照、要么看到完整新快照，不可能看到半合并状态。
-4. **换后清理**：上一代插件在 Swap 成功之后才按逆序 `Close`，
-   不会影响已持有旧快照的在途请求的读取一致性（注意：长请求若仍在调用旧插件，
-   业务侧应自行通过引用计数/连接排空保证宽限期——脚手架保证的是状态可见性原子性）。
+```go
+lease := application.Acquire()
+if lease == nil { /* 尚未启动或已 Shutdown */ }
+defer lease.Release()
 
-`app.App` 额外保证：
+snap := lease.Snapshot() // 整个处理期间，snap 的配置和插件都不会被动到
+port := snap.Config.GetInt("server.port")
+p, _ := snap.Plugin("b") // 即使中途发生重载，这里调到的也是同一代、已打开的插件
+```
 
-- `Boot`：配置加载失败时不会构建任何快照；首快照构建失败则进程保持未启动。
-- `Reload`：配置重新加载失败（`*config.LoadError`）或快照构建失败
-  （`*runtime.ReloadError`，可用 `errors.As` 区分）时，**当前服务状态原封不动**。
-- `Boot/Reload/Shutdown` 之间用互斥锁串行化；`Snapshot()` 读取无锁、永不为半状态。
-- `Shutdown` 原子摘除当前快照后逆序关闭插件，重复调用安全。
+### 生命周期保证
+
+1. **先建后换**：重载先构建并初始化新一代，构建期间旧代继续服务；构建失败
+   （或 context 取消）时不触碰任何在服状态，返回 `*runtime.ReloadError`，
+   `OldKept=true`，Kind 为 `reload_build_failed` / `reload_timeout`。
+2. **原子发布**：构建成功后只执行**一次**指针交换。新来的处理单元**立刻**拿到
+   新代；交换发生前已经 `Acquire` 的处理单元从头到尾都使用**完整一致的旧代**——
+   配置和插件始终配套，绝不会出现半新半旧。
+3. **用完才回收**：旧代只有在其上的**全部租约都 Release** 之后才会按逆序
+   `Close` 插件。处理单元还在用时，底层资源绝不会被提前清理。
+4. **主流程不被拖住**：旧代的插件关闭发生在锁外（无人占用时在重载路径同步关闭
+   以保持换代语义；仍被占用时在最后一个 Release 后异步关闭）。慢使用者只会让旧代
+   多活一会儿，不会阻塞重载本身，也不会阻塞调用 Release 的人。
+
+`App` 侧对应接口：
+
+| API | 语义 |
+| --- | --- |
+| `Acquire() *runtime.Lease` + `Release()` | **推荐**。固定一整代，跨重载安全，插件调用必须走它 |
+| `Snapshot() *runtime.Snapshot` | 无锁只读快照，不固定代际；仅用于读取瞬间值。不要拿它跨重载调用插件 |
+| `RuntimeStatus() runtime.ManagerStatus` | 可观测性：当前版本、是否正在重载、未回收旧代、回收历史与结局 |
+
+### 回收状态与可观测性
+
+`RuntimeStatus()` / `runtime.Manager.Status()` 返回：
+
+- `ActiveVersion`：当前对外服务的版本号（首启前/Shutdown 后为 0）。
+- `Reloading`：此刻是否有重载正在构建/发布。
+- `Retained`：**已退役但尚未回收**的旧代（按时间从旧到新），每代带租约数和状态：
+  - `draining`：正常等待在途使用者结束（尚在排空宽限时间内）；
+  - `stuck`：超过 `DrainTimeout` 仍有人占用。stuck 代**不会被强拆**，仍可被持有者
+    正常使用，继续占用容量；等持有者释放后按正常流程回收。
+- `History`：最近回收的代（有界，最多 16 个，最新在前），每代带可区分的**结局**：
+  - `drained`：所有租约正常释放后回收；
+  - `drain_timeout`：曾超过排空时限（使用者太慢），但最终仍正常释放并回收；
+  - `close_failed`：插件 `Close` 报错（错误文本在 `CloseErr` 字段），代仍从容量中移除；
+  - `shutdown`：在 Shutdown 流程中排空并回收。
+
+### 容量上限与拒绝策略
+
+旧代不能无限堆积。`Options.MaxRetainedGenerations`（默认 2）限定同时可保留多少个
+"已退役、仍被占用"的旧代：
+
+- 容量以内：重载照常进行，旧代等到真正没人用了再回收；
+- **到达上限**：新的重载在**构建之前**就被明确拒绝，返回
+  `*runtime.ReloadError{Kind: runtime.ReloadDrainFull, OldKept: true}`，
+  原因文本中区分 `draining` / `stuck` 的数量。脚手架**绝不**拆毁还在被使用的旧代，
+  也不会默默堆积；
+- 任意旧代随后排空（包括 `close_failed`）都会释放容量，之后重载恢复可用；
+- 构建失败**不消耗**容量。
+
+相关参数（`app.Options`，零值走默认值）：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `MaxRetainedGenerations` | 2 | 可保留的在途旧代上限；达到后新重载被 `reload_drain_full` 拒绝 |
+| `DrainTimeout` | 30s | 旧代等待在途使用者的时限；超时后置为 `stuck`（不强拆） |
+| `ShutdownWait` | 10s | `Shutdown` 等待在途旧代排空的最长时间；超时后未结束者留给最后的 Release 回收 |
+
+`New(loader, build)` 签名保持不变（使用默认参数）；需要自定义时用
+`app.NewWithOptions(loader, build, app.Options{...})`。
+
+### Shutdown
+
+`Shutdown` 原子摘处在服代并立即回收所有无人占用的代；仍被租约固定的代**不会**在
+活使用者脚下关闭，而是在其最后一次 `Release` 时回收（结局标记为 `shutdown`，
+已经超时过的标 `drain_timeout`）。`Shutdown` 最多等待 `ShutdownWait`，重复调用安全，
+并聚合同步回收阶段产生的插件关闭错误。
+
+### 对既有用法的兼容范围
+
+- `config` / `plugin` 包 API 完全不变，其全部既有测试无改动通过。
+- `runtime.Holder` / `runtime.Reloader` / `runtime.ClosePlugins` 保留原语义：
+  `Reloader` 仍是"换代后立即关闭旧插件"，适用于不存在跨重载长生命周期插件调用的场景。
+  原有 runtime 用例全部保留并通过。
+- `app.New(loader, build)`、`Boot` / `Reload` / `Snapshot()` / `Shutdown()` 签名不变：
+  原有 app 用例（含"换代后旧插件即关闭"的断言与并发读断言）全部无改动通过。
+  需要跨重载保护在途工作时，把处理逻辑从 `Snapshot()` 迁移到 `Acquire()/Release()`。
+- 旧代码若只做瞬时读取（读一个配置值就结束），`Snapshot()` 行为与之前一致。
 
 ## 验证方法
 
 ```bash
-# 全部单元测试（含 -race 竞态检测）
+# 全部单元测试（含 -race 竞态检测），建议多跑几轮确认并发用例稳定
 go test ./... -race
+go test ./... -race -count=3
 
-# 仅跑某一层并查看测试日志（日志含“输入 + 判定依据”）
-go test ./config/  -race -v
-go test ./plugin/  -race -v
+# 仅跑某一层并查看测试日志（日志含“INPUT + JUDGEMENT”，可直接审计场景与判定依据）
 go test ./runtime/ -race -v
 go test ./app/     -race -v
 
 go vet ./...
+gofmt -l .
 ```
 
 ### 测试覆盖矩阵
@@ -149,6 +221,15 @@ go vet ./...
 | 重载失败保留旧状态与旧插件、错误可区分 | `runtime.TestReloadFailureKeepsOld`、`TestReloadCanceled`、`TestReloadNilConfig` |
 | 重载成功原子换入并关闭旧一代 | `runtime.TestReloadSuccessSwapsAndClosesOld` |
 | 高并发重载串行收敛、读取永不为 nil | `runtime.TestConcurrentReloads` |
+| **在途使用者跨重载完整使用旧代，新来者立刻见新代** | `runtime.TestLeasePinsOldGenerationAcrossReload` |
+| **多使用者 × 多次重载交错，配置与插件始终自洽（-race）** | `runtime.TestInterleavedUsersAndReloadsStress` |
+| **到达容量上限重载被明确拒绝（reload_drain_full），旧代不被拆** | `runtime.TestReloadRefusedAtCapacity` |
+| **超时旧代标记 stuck、仍占用容量、释放后按 drain_timeout 回收** | `runtime.TestDrainTimeoutMarksStuck` |
+| **Close 失败结局可区分（close_failed）且容量仍释放** | `runtime.TestCloseFailureOutcome` |
+| **多租约引用计数：最后一个 Release 才回收，Release 幂等** | `runtime.TestMultipleLeasesRefcount` |
+| **Shutdown 不强关在途旧代，释放后恰好关闭一次** | `runtime.TestShutdownWaitsAndKeepsLeasedOpen` |
+| **构建失败不消耗容量；首启前/Shutdown 后 Acquire 为 nil** | `runtime.TestBuildFailureConsumesNoCapacity`、`TestAcquireBeforeBootAndAfterShutdown` |
+| **端到端：请求跨重载用完旧代 / 门面容量拒绝** | `app.TestAppLeaseSurvivesReload`、`TestAppReloadRejectedAtCapacity` |
 | 端到端：启动/非法配置拒绝/重载失败保旧/成功换代/并发读 | `app.TestBootAndShutdown` 等全部 `app/*_test.go` |
 
 所有测试均使用 `log.Printf("INPUT ... / JUDGEMENT ...")` 打印输入数据与判定依据，

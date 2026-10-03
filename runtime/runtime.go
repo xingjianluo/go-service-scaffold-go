@@ -1,17 +1,57 @@
-// Package runtime provides atomic configuration/plugin snapshots and
-// coordinated hot reload.
+// Package runtime provides atomic configuration/plugin snapshots,
+// coordinated hot reload, and generation-scoped leases.
 //
-// Reload rule:
+// Two layers are exposed:
 //
-//  1. The new Snapshot is built (config validated, plugins initialized) BEFORE
-//     the old one is touched. A build failure leaves the serving snapshot
-//     completely untouched and returns a *ReloadError with a distinguishable
-//     FailureKind.
-//  2. Replacement is a single atomic pointer swap: concurrent readers always
-//     observe either the complete old snapshot or the complete new one, never
-//     a partially-merged state.
-//  3. Plugins of the previous snapshot are closed in reverse initialization
-//     order only after the swap has succeeded.
+//   - Primitives: Holder (an atomic pointer to a Snapshot), Reloader and
+//     ClosePlugins. Reloader swaps snapshots and immediately closes the
+//     displaced plugins; use it only when no long-lived work calls into a
+//     snapshot's plugins.
+//   - Generation manager: Manager + Lease. This is the layer services should
+//     use. Every reload publishes a new numbered generation; a unit of work
+//     Acquires a Lease that pins one generation and Releases it when done.
+//
+// Read lifecycle:
+//
+//  1. The new generation is built (config validated, plugins initialized)
+//     BEFORE the old one is touched. A build failure leaves the serving
+//     generation completely untouched and returns a *ReloadError with a
+//     distinguishable FailureKind.
+//  2. Publication is a single atomic pointer swap: Acquire (and
+//     CurrentSnapshot) always observe either the complete old generation or
+//     the complete new one, never a partially-merged state. Work that started
+//     on the old generation keeps using the SAME config AND plugins until it
+//     calls Release; those plugins cannot be closed underneath it.
+//  3. New work arriving after the swap immediately pins the new generation.
+//  4. A retired generation is reclaimed (plugins closed in reverse
+//     initialization order) only after ALL its leases are released. The
+//     release path never blocks on Close (closing is asynchronous); the
+//     reload main path never waits for a slow lease holder.
+//
+// Reclamation observability (Manager.Status):
+//
+//   - ActiveVersion: the generation currently served to new work.
+//   - Reloading: whether a reload build+publish is in progress.
+//   - Retained: retired-but-unreclaimed generations, each with its lease
+//     count and state: "draining" (still waiting inside the drain budget) or
+//     "stuck" (the DrainTimeout elapsed while leases were held). Stuck
+//     generations remain fully usable by their holders and are never forcibly
+//     closed; they are reclaimed normally on their last Release.
+//   - History: a bounded list of the most recently reclaimed generations with
+//     the terminal outcome: drained (normal), drain_timeout (users overran
+//     the budget but eventually released), close_failed (one or more Close
+//     calls failed; the error text is attached), or shutdown.
+//
+// Capacity and refusal policy:
+//
+// MaxRetainedGenerations bounds how many drained/stuck generations may
+// accumulate. While below the limit, reloads proceed and old generations wait
+// for their users. At the limit, a new reload is refused BEFORE building with
+// ReloadError kind ReloadDrainFull (OldKept=true): no in-use generation is
+// torn down and memory/resource usage cannot grow without bound. Retained
+// generations that later reach zero leases free capacity again, and even a
+// close_failed generation frees its slot (its failure remains visible in
+// History).
 package runtime
 
 import (
@@ -82,6 +122,11 @@ const (
 	ReloadFailureUnknown FailureKind = iota
 	ReloadBuildFailed
 	ReloadTimeout
+	// ReloadDrainFull means the reload was refused BEFORE building the new
+	// generation because the number of retired-but-unreclaimed generations
+	// already equals the configured capacity. No in-use generation is ever
+	// torn down to make room.
+	ReloadDrainFull
 )
 
 func (k FailureKind) String() string {
@@ -90,6 +135,8 @@ func (k FailureKind) String() string {
 		return "reload_build_failed"
 	case ReloadTimeout:
 		return "reload_timeout"
+	case ReloadDrainFull:
+		return "reload_drain_full"
 	default:
 		return "reload_unknown"
 	}
