@@ -17,16 +17,27 @@
 //     BEFORE the old one is touched. A build failure leaves the serving
 //     generation completely untouched and returns a *ReloadError with a
 //     distinguishable FailureKind.
-//  2. Publication is a single atomic pointer swap: Acquire (and
+//  2. The build runs WITHOUT the bookkeeping lock (it is serialized by a
+//     separate reload lock). Therefore, while a reload is still preparing:
+//     Status returns immediately with Reloading=true and the still-serving
+//     ActiveVersion; Acquire pins and serves the active generation at once;
+//     Release keeps reclaiming retired generations. No read or request ever
+//     waits for a slow build, no matter how long it takes.
+//  3. Publication is a single atomic pointer swap: Acquire (and
 //     CurrentSnapshot) always observe either the complete old generation or
 //     the complete new one, never a partially-merged state. Work that started
 //     on the old generation keeps using the SAME config AND plugins until it
 //     calls Release; those plugins cannot be closed underneath it.
-//  3. New work arriving after the swap immediately pins the new generation.
-//  4. A retired generation is reclaimed (plugins closed in reverse
+//  4. New work arriving after the swap immediately pins the new generation.
+//  5. A retired generation is reclaimed (plugins closed in reverse
 //     initialization order) only after ALL its leases are released. The
 //     release path never blocks on Close (closing is asynchronous); the
 //     reload main path never waits for a slow lease holder.
+//
+// Reload convergence: whether a reload succeeds, its preparation fails, or it
+// is canceled/times out while building, the Reloading flag always converges
+// back to false and a failed/timed-out attempt never mutates the served
+// generation (and consumes no generation ID or retained capacity).
 //
 // Reclamation observability (Manager.Status):
 //

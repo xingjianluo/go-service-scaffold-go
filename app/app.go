@@ -19,7 +19,11 @@
 //     that are not leased; leased ones close on their last Release. It is safe
 //     to call more than once.
 //   - Boot/Reload/Shutdown are mutually serialized; pinning through Acquire is
-//     lock-free on the hot path and never observes a half-built state.
+//     lock-free on the hot path and never observes a half-built state. A slow
+//     reload (one whose snapshot build takes a long time) never blocks
+//     Acquire, Snapshot, Release or RuntimeStatus: while it is still
+//     preparing, RuntimeStatus reports Reloading=true at once and new work is
+//     served the still-active old generation immediately.
 package app
 
 import (
@@ -143,7 +147,8 @@ func (a *App) Snapshot() *runtime.Snapshot {
 
 // RuntimeStatus exposes generation bookkeeping: active version, in-progress
 // reload flag, retained (draining/stuck) generations and reclaimed history
-// with terminal outcomes.
+// with terminal outcomes. It always returns immediately; in particular it
+// reports Reloading=true on the spot while a slow reload is still preparing.
 func (a *App) RuntimeStatus() runtime.ManagerStatus {
 	return a.mgr.Status()
 }

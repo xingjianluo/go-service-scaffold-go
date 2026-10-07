@@ -188,6 +188,13 @@ type Manager struct {
 	build BuildFunc
 	opts  Options
 
+	// reloadMu serializes whole reload sequences (capacity decision + build +
+	// publication are one logical transaction). It is a DIFFERENT lock from mu
+	// and is never held while waiting on mu: the slow build runs holding only
+	// reloadMu, so Status/Acquire/Release keep taking the short mu and respond
+	// immediately on the old generation.
+	reloadMu sync.Mutex
+
 	mu        sync.Mutex
 	active    *generation
 	retained  []*generation // retired but not reclaimed (draining/stuck), oldest first
@@ -356,6 +363,11 @@ func (m *Manager) reaperClose(g *generation) {
 // Build policy mirrors Reloader: a build failure (or a canceled context)
 // leaves the active generation completely untouched.
 //
+// The slow build does NOT hold the bookkeeping lock: while it runs, Status
+// reports Reloading=true immediately, Acquire keeps serving the active
+// generation without waiting, and Release keeps reclaiming retired
+// generations. Only the short pre-check and publication sections take mu.
+//
 // After publication the previous generation is retired. Retirement never
 // blocks waiting for leases: with zero leases it is reclaimed right away;
 // otherwise it drains in the background (up to DrainTimeout, then it is
@@ -369,13 +381,15 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	// Reloads are serialized for the whole build+publish sequence: the
-	// capacity decision and the publication must be atomic, otherwise two
-	// concurrent reloads could both pass the capacity check and overshoot it.
-	// Reading the served generation (Acquire's atomic load) stays lock-free;
-	// only the short lease-pin waits behind an in-progress build.
-	m.mu.Lock()
+	// Whole build+publish sequences are serialized, but by reloadMu rather
+	// than mu so the slow build cannot block readers, status queries or
+	// lease releases. Lock order is reloadMu -> mu, never the reverse.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
 
+	// Short critical section: pre-checks + publish the observable
+	// "a reload is in progress" flag, then release mu BEFORE building.
+	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return &ReloadError{
@@ -396,27 +410,26 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 	m.reloading = true
+	m.cond.Broadcast()
+	m.mu.Unlock()
 
-	// Build the new world while the old one keeps serving. Manager state
-	// cannot change here because Reload holds mu (and Shutdown takes it too).
-	next, err := m.build(ctx, cfg)
-	if err != nil {
-		m.reloading = false
-		m.cond.Broadcast()
-		m.mu.Unlock()
+	// Build the new world while the old one keeps serving. mu is free here,
+	// so Acquire/Release/Status never wait on this build no matter how slow
+	// it is.
+	next, buildErr := m.build(ctx, cfg)
+	if buildErr != nil {
+		m.clearReloading()
 		kind := ReloadBuildFailed
 		reason := "snapshot build failed; previous snapshot remains in service"
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			kind = ReloadTimeout
 			reason = "reload canceled or timed out while building snapshot"
-			err = fmt.Errorf("%w: %v", ctxErr, err)
+			buildErr = fmt.Errorf("%w: %v", ctxErr, buildErr)
 		}
-		return &ReloadError{Kind: kind, Reason: reason, WrapErr: err, OldKept: true}
+		return &ReloadError{Kind: kind, Reason: reason, WrapErr: buildErr, OldKept: true}
 	}
 	if next == nil || next.Config == nil {
-		m.reloading = false
-		m.cond.Broadcast()
-		m.mu.Unlock()
+		m.clearReloading()
 		return &ReloadError{
 			Kind:    ReloadBuildFailed,
 			Reason:  "build returned an empty snapshot; previous snapshot remains in service",
@@ -424,6 +437,28 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
+	// Short publication critical section. Re-check state under mu because
+	// Shutdown (or, theoretically, other bookkeeping) may have run while the
+	// build was in progress.
+	m.mu.Lock()
+	if m.closed {
+		m.reloading = false
+		m.cond.Broadcast()
+		m.mu.Unlock()
+		// Shutdown won while the build ran: the new snapshot was never
+		// published. Clean up its plugins so the abandoned build leaks
+		// nothing, and report that the previous state is untouched.
+		var discardErr error
+		if cerr := ClosePlugins(next.Plugins); cerr != nil {
+			discardErr = fmt.Errorf("(additionally, closing the unpublished snapshot failed: %v)", cerr)
+		}
+		return &ReloadError{
+			Kind:    ReloadBuildFailed,
+			Reason:  "manager shut down while the new snapshot was being prepared; it was never published",
+			WrapErr: discardErr,
+			OldKept: true,
+		}
+	}
 	m.nextID++
 	ng := &generation{id: m.nextID, snap: next, state: GenActive, bornAt: time.Now()}
 	prev := m.active
@@ -453,6 +488,18 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 	return nil
+}
+
+// clearReloading clears the in-progress flag after a build that cannot
+// publish (failure/empty result), unless Shutdown already took over (it
+// clears the flag itself while marking the manager closed).
+func (m *Manager) clearReloading() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.closed {
+		m.reloading = false
+	}
+	m.cond.Broadcast()
 }
 
 // retainedCountsLocked splits retained generations into stuck vs draining.

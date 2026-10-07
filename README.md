@@ -114,13 +114,22 @@ p, _ := snap.Plugin("b") // 即使中途发生重载，这里调到的也是同�
 
 1. **先建后换**：重载先构建并初始化新一代，构建期间旧代继续服务；构建失败
    （或 context 取消）时不触碰任何在服状态，返回 `*runtime.ReloadError`，
-   `OldKept=true`，Kind 为 `reload_build_failed` / `reload_timeout`。
-2. **原子发布**：构建成功后只执行**一次**指针交换。新来的处理单元**立刻**拿到
+   `OldKept=true`，Kind 为 `reload_build_failed` / `reload_timeout`。失败或超时的
+   尝试**不消耗版本号、不占用保留容量**，标志位也一定会复位。
+2. **准备阶段不持锁、可观测、不堵请求**：构建（可能很慢）只持有一把与记账锁分离的
+   "重载串行锁"，**不持有**记账锁。因此在"重载还在准备、尚未生效"的整段窗口里：
+   - `RuntimeStatus()` / `Manager.Status()` **立刻返回**，`Reloading=true`，
+     `ActiveVersion` 仍是正在服务的旧版本，`Retained` / `History` 为该瞬间的真实读数；
+     绝不会等到重载结束才返回（那样反而只能看到 `Reloading=false`）。
+   - `Acquire()` 立即固定并返回**当前旧代**，`Snapshot()` 立即读到旧代，
+     `Release()` 照常触发回收；这些操作都不会被慢构建挂住。
+   - 已经在处理的请求在自己固定的旧代上照常跑完；期间新来的请求全部拿到旧代继续干活。
+3. **原子发布**：构建成功后只执行**一次**指针交换。交换后新来的处理单元**立刻**拿到
    新代；交换发生前已经 `Acquire` 的处理单元从头到尾都使用**完整一致的旧代**——
    配置和插件始终配套，绝不会出现半新半旧。
-3. **用完才回收**：旧代只有在其上的**全部租约都 Release** 之后才会按逆序
+4. **用完才回收**：旧代只有在其上的**全部租约都 Release** 之后才会按逆序
    `Close` 插件。处理单元还在用时，底层资源绝不会被提前清理。
-4. **主流程不被拖住**：旧代的插件关闭发生在锁外（无人占用时在重载路径同步关闭
+5. **主流程不被拖住**：旧代的插件关闭发生在锁外（无人占用时在重载路径同步关闭
    以保持换代语义；仍被占用时在最后一个 Release 后异步关闭）。慢使用者只会让旧代
    多活一会儿，不会阻塞重载本身，也不会阻塞调用 Release 的人。
 
@@ -132,12 +141,33 @@ p, _ := snap.Plugin("b") // 即使中途发生重载，这里调到的也是同�
 | `Snapshot() *runtime.Snapshot` | 无锁只读快照，不固定代际；仅用于读取瞬间值。不要拿它跨重载调用插件 |
 | `RuntimeStatus() runtime.ManagerStatus` | 可观测性：当前版本、是否正在重载、未回收旧代、回收历史与结局 |
 
+### 重载准备阶段（尚未生效）的读取生命周期
+
+一次重载在内部分为两段：**准备**（读配置、构建并初始化新一代插件，可能很慢）与
+**发布**（一次指针交换，瞬时完成）。准备阶段旧代始终在服，脚手架对这一阶段的
+读取做出如下承诺：
+
+| 时刻 / 操作 | `Status().Reloading` | `ActiveVersion` | 新来的 `Acquire()` | 在途请求 |
+| --- | --- | --- | --- | --- |
+| 重载开始前 | `false` | vN | 固定 vN | 使用 vN |
+| **准备中（慢构建）** | **`true`（查询立即返回）** | **仍为 vN** | **立即固定 vN，不等待** | 继续在 vN 上跑完 |
+| 发布成功后 | `false` | vN+1 | 立即固定 vN+1 | 仍固定并使用旧 vN 到 Release |
+| 准备失败 / 超时 | `false`（标志复位） | 仍为 vN | 固定 vN | 完全不受影响 |
+
+实现要点：准备阶段只持有一把与记账锁 `mu` 分离的 `reloadMu`（锁顺序恒为
+`reloadMu → mu`，从不反向），因此 `Status` / `Acquire` / `Release` 只竞争那把
+很短的记账锁，任何一个都不会被慢构建长时间挂住。若准备期间发生 `Shutdown`，
+新构建即使随后完成也**不会发布**，其插件会被关闭丢弃，旧状态语义不变。
+
 ### 回收状态与可观测性
 
 `RuntimeStatus()` / `runtime.Manager.Status()` 返回：
 
-- `ActiveVersion`：当前对外服务的版本号（首启前/Shutdown 后为 0）。
-- `Reloading`：此刻是否有重载正在构建/发布。
+- `ActiveVersion`：当前对外服务的版本号（首启前/Shutdown 后为 0）。慢重载准备期间
+  它保持为旧版本，只有指针交换后才跳到新版本。
+- `Reloading`：此刻是否有重载正在构建/发布。该标志在进入构建前置为 `true`，
+  无论本次重载成功、准备失败还是超时，结束时一定收敛回 `false`；读取它不需要
+  等待构建，因此慢重载进行中查询会**立刻**得到 `true`。
 - `Retained`：**已退役但尚未回收**的旧代（按时间从旧到新），每代带租约数和状态：
   - `draining`：正常等待在途使用者结束（尚在排空宽限时间内）；
   - `stuck`：超过 `DrainTimeout` 仍有人占用。stuck 代**不会被强拆**，仍可被持有者
@@ -222,6 +252,10 @@ gofmt -l .
 | 重载成功原子换入并关闭旧一代 | `runtime.TestReloadSuccessSwapsAndClosesOld` |
 | 高并发重载串行收敛、读取永不为 nil | `runtime.TestConcurrentReloads` |
 | **在途使用者跨重载完整使用旧代，新来者立刻见新代** | `runtime.TestLeasePinsOldGenerationAcrossReload` |
+| **慢重载准备中 Status 立刻返回 Reloading=true 且其它对外读数一致** | `runtime.TestStatusReflectsReloadingImmediately` |
+| **慢重载不堵请求：在途请求跑完、新请求立即拿旧代、Acquire/Release 不挂** | `runtime.TestSlowReloadNeverBlocksRequests` |
+| **慢重载准备失败 / 超时：标志复位、旧状态不动、之后可正常重载** | `runtime.TestSlowReloadFailureAndTimeoutReset` |
+| **慢重载 × 状态查询 × 请求并发交错：始终自洽、不卡死（-race）** | `runtime.TestConcurrentReloadStatusRequestsInterleaved` |
 | **多使用者 × 多次重载交错，配置与插件始终自洽（-race）** | `runtime.TestInterleavedUsersAndReloadsStress` |
 | **到达容量上限重载被明确拒绝（reload_drain_full），旧代不被拆** | `runtime.TestReloadRefusedAtCapacity` |
 | **超时旧代标记 stuck、仍占用容量、释放后按 drain_timeout 回收** | `runtime.TestDrainTimeoutMarksStuck` |
@@ -230,6 +264,7 @@ gofmt -l .
 | **Shutdown 不强关在途旧代，释放后恰好关闭一次** | `runtime.TestShutdownWaitsAndKeepsLeasedOpen` |
 | **构建失败不消耗容量；首启前/Shutdown 后 Acquire 为 nil** | `runtime.TestBuildFailureConsumesNoCapacity`、`TestAcquireBeforeBootAndAfterShutdown` |
 | **端到端：请求跨重载用完旧代 / 门面容量拒绝** | `app.TestAppLeaseSurvivesReload`、`TestAppReloadRejectedAtCapacity` |
+| **端到端：慢重载准备中可立即查到、请求不被阻塞、失败/超时收敛** | `app.TestAppSlowReloadObservableAndNonBlocking` |
 | 端到端：启动/非法配置拒绝/重载失败保旧/成功换代/并发读 | `app.TestBootAndShutdown` 等全部 `app/*_test.go` |
 
 所有测试均使用 `log.Printf("INPUT ... / JUDGEMENT ...")` 打印输入数据与判定依据，
