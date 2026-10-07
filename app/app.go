@@ -20,6 +20,13 @@
 //     to call more than once.
 //   - Boot/Reload/Shutdown are mutually serialized; pinning through Acquire is
 //     lock-free on the hot path and never observes a half-built state.
+//   - While a reload is still PREPARING (a slow build that has not published),
+//     RuntimeStatus returns immediately with Reloading=true and
+//     ReloadingSince, Acquire keeps serving the old generation without
+//     blocking, and in-flight leases run to completion; only after the single
+//     atomic publication do new Acquires see the new generation. A failed or
+//     timed-out prepare, or a Shutdown landing mid-build, always converges back
+//     to a consistent state with the old generation intact.
 package app
 
 import (

@@ -124,6 +124,36 @@ p, _ := snap.Plugin("b") // 即使中途发生重载，这里调到的也是同�
    以保持换代语义；仍被占用时在最后一个 Release 后异步关闭）。慢使用者只会让旧代
    多活一会儿，不会阻塞重载本身，也不会阻塞调用 Release 的人。
 
+### 慢重载"准备阶段"的读取生命周期
+
+重载分为**准备（构建新一代）**与**发布（一次原子交换）**两段。准备阶段可能很慢
+（插件初始化、拉取远端资源等），脚手架通过**把"重载串行化"与"代际状态保护"拆成
+两把锁**保证这段时间的可读性与可用性：构建只持有重载串行锁，**不持有**代际状态锁。
+
+因此在新一代**还在准备、尚未生效**的整段时间里，无论准备多久：
+
+- **状态可立即查询且如实反映正在重载**：`RuntimeStatus()` / `Manager.Status()`
+  立即返回，`Reloading=true`，并带 `ReloadingSince`（本次准备开始时间）；此时
+  `ActiveVersion` 仍是旧版本号。发布完成后同一份状态翻转为 `Reloading=false`、
+  `ActiveVersion` 指向新版本。同一时刻的其它只读入口（`ActiveVersion()`、
+  `Snapshot()`）都与"仍在服务的旧代"保持一致，绝不会读到半新半旧。
+- **业务请求不被堵住**：
+  - 已经在处理的请求：继续在其 `Acquire` 固定的旧代上**照常跑完并按时 Release**，
+    `Release`/回收路径不会被慢构建拖住；
+  - 期间新来的请求：`Acquire()` **立即**返回，固定的是当时仍在服务的**旧代**，
+    立刻继续干活，而不是排队等构建；
+  - 等这次重载**真正发布**之后，新来的请求才立即切到新代。
+  - 即便准备阶段特别长，`Acquire` / `Release` / `Status` / `Snapshot` 都不会长时间挂住。
+- **结局一致收敛**：
+  - 成功：单次交换后新请求见新代，旧代按租约正常排空回收；
+  - 准备失败（`reload_build_failed`）或 context 超时（`reload_timeout`）：清除
+    `Reloading` 标志，**完全不动**在服旧代及其插件，也不退役任何代，随后仍可再次重载；
+  - 准备期间恰好 `Shutdown`：Shutdown 为准，构建完成的新一代会被**丢弃**（关闭其
+    插件）并返回保旧失败，绝不在 Shutdown 之后"复活"一个在服代；被旧租约固定的代
+    仍可正常使用，最后一次 Release 时关闭。
+  - 多个状态查询、业务请求与慢重载并发交错时，每次读到的都是某一**完整代**，
+    版本号不倒退，互不卡死（有 `-race` 下的并发交错用例守护）。
+
 `App` 侧对应接口：
 
 | API | 语义 |
@@ -137,7 +167,10 @@ p, _ := snap.Plugin("b") // 即使中途发生重载，这里调到的也是同�
 `RuntimeStatus()` / `runtime.Manager.Status()` 返回：
 
 - `ActiveVersion`：当前对外服务的版本号（首启前/Shutdown 后为 0）。
-- `Reloading`：此刻是否有重载正在构建/发布。
+- `Reloading`：此刻是否有重载正在构建/发布。准备阶段（构建未发布）期间查询会
+  **立即**得到 `true`，不会等到重载结束；无重载时为 `false`。
+- `ReloadingSince`：本次正在进行的重载开始准备的时间；`Reloading=false` 时为零值。
+  可用于观测"正在重载"持续了多久（慢准备阶段一目了然）。
 - `Retained`：**已退役但尚未回收**的旧代（按时间从旧到新），每代带租约数和状态：
   - `draining`：正常等待在途使用者结束（尚在排空宽限时间内）；
   - `stuck`：超过 `DrainTimeout` 仍有人占用。stuck 代**不会被强拆**，仍可被持有者
@@ -201,9 +234,21 @@ go test ./... -race -count=3
 go test ./runtime/ -race -v
 go test ./app/     -race -v
 
+# 只看“慢重载准备阶段”这一组用例（准备中可查/不堵业务/失败超时收敛/并发交错/Shutdown 竞态）
+go test ./runtime/ -race -v -run 'SlowPrepare|SlowReload|ShutdownDuringSlowPrepare'
+go test ./app/     -race -v -run 'SlowReload'
+
 go vet ./...
 gofmt -l .
 ```
+
+“慢重载”用例使用**可控闸门 builder**（`gateBuild` / `gateFacadeBuild`）：构建进入
+准备阶段后阻塞，直到测试显式放行或 context 结束，从而确定性地复现"准备很慢"的窗口。
+用例在该窗口内并发发起 `Status`/`RuntimeStatus` 与多个 `Acquire`，并以有界超时
+（毫秒级）断言它们**立即返回**；随后分别放行成功、注入构建失败、让 context 超时，
+断言状态收敛与旧代完好。日志中 `INPUT` 会打印准备窗口实测耗时与各操作延迟，
+`JUDGEMENT` 打印判定依据（如 `reloading=true active=v1`、首个 Acquire 延迟、
+旧插件 `closes=0/1`、结局 kind 等）。
 
 ### 测试覆盖矩阵
 
@@ -229,6 +274,12 @@ gofmt -l .
 | **多租约引用计数：最后一个 Release 才回收，Release 幂等** | `runtime.TestMultipleLeasesRefcount` |
 | **Shutdown 不强关在途旧代，释放后恰好关闭一次** | `runtime.TestShutdownWaitsAndKeepsLeasedOpen` |
 | **构建失败不消耗容量；首启前/Shutdown 后 Acquire 为 nil** | `runtime.TestBuildFailureConsumesNoCapacity`、`TestAcquireBeforeBootAndAfterShutdown` |
+| **慢准备中状态查询立即返回并如实反映正在重载（含 ReloadingSince、旧版本一致）** | `runtime.TestStatusImmediatelyReflectsPreparingReload` |
+| **慢准备期间在途请求按时跑完、新请求立即拿旧代不被阻塞，发布后才切新代** | `runtime.TestSlowPrepareNeverBlocksBusiness` |
+| **慢准备构建失败 / context 超时：标志复位、旧代与旧插件完好、可再次重载** | `runtime.TestSlowPrepareBuildFailureResetsFlag`、`runtime.TestSlowPrepareTimeoutResetsFlag` |
+| **慢重载 × 状态查询 × 业务请求并发交错，结果自洽、无卡顿、版本不倒退（-race）** | `runtime.TestSlowReloadInterleavedWithStatusAndWork` |
+| **准备期间 Shutdown：丢弃构建好的新代、不复活在服代、旧租约可用** | `runtime.TestShutdownDuringSlowPrepareDiscardsNewGeneration` |
+| **端到端（门面）：慢准备中 RuntimeStatus 立即可查、Acquire 不堵、发布后切新** | `app.TestAppFacadeStatusAndWorkDuringSlowReload` |
 | **端到端：请求跨重载用完旧代 / 门面容量拒绝** | `app.TestAppLeaseSurvivesReload`、`TestAppReloadRejectedAtCapacity` |
 | 端到端：启动/非法配置拒绝/重载失败保旧/成功换代/并发读 | `app.TestBootAndShutdown` 等全部 `app/*_test.go` |
 

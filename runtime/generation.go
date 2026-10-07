@@ -96,6 +96,11 @@ type GenerationInfo struct {
 type ManagerStatus struct {
 	ActiveVersion uint64
 	Reloading     bool
+	// ReloadingSince is when the in-progress reload started preparing. It is
+	// the zero time when Reloading is false. Because a reload prepares the new
+	// generation OUTSIDE the bookkeeping lock, Status returns immediately even
+	// while a slow build is underway and honestly reports Reloading=true.
+	ReloadingSince time.Time
 	// Retained lists retired-but-not-reclaimed generations (draining or stuck),
 	// oldest first.
 	Retained []GenerationInfo
@@ -188,14 +193,24 @@ type Manager struct {
 	build BuildFunc
 	opts  Options
 
+	// reloadMu serializes whole reloads (build+publish). It is a SEPARATE lock
+	// from mu on purpose: the build step can be arbitrarily slow and MUST run
+	// without holding mu, otherwise Status/Acquire/Release would block for the
+	// whole prepare phase and the in-progress Reloading state could never be
+	// observed. Acquire order is always reloadMu -> mu, never the reverse.
+	reloadMu sync.Mutex
+
 	mu        sync.Mutex
 	active    *generation
 	retained  []*generation // retired but not reclaimed (draining/stuck), oldest first
 	history   []*generation // reclaimed, newest first, capped at historyLimit
 	reloading bool
-	closed    bool
-	nextID    uint64
-	cond      *sync.Cond
+	// reloadingSince is set together with reloading (under mu) and zeroed when
+	// the reload settles; Status surfaces it while a reload is preparing.
+	reloadingSince time.Time
+	closed         bool
+	nextID         uint64
+	cond           *sync.Cond
 
 	// current is the single atomic publication point readers load without
 	// taking mu. It always points to the active generation, or nil before the
@@ -348,13 +363,31 @@ func (m *Manager) reaperClose(g *generation) {
 
 // Reload builds a new generation and publishes it atomically.
 //
+// Observation/non-blocking guarantees during a slow prepare phase:
+//
+// Reloads are serialized on a dedicated lock (reloadMu), but the potentially
+// slow build runs WITHOUT the bookkeeping lock mu. Consequently, while the new
+// generation is still being prepared:
+//
+//   - Status returns immediately and honestly reports Reloading=true (with
+//     ReloadingSince); the old ActiveVersion stays visible and consistent.
+//   - Acquire returns immediately, pinning the still-served old generation, so
+//     new work is never blocked waiting for the build.
+//   - Release/Acquire of in-flight work proceed normally; a slow build cannot
+//     stall lease release or reclamation.
+//
 // Capacity policy: before building, if the number of retired-but-unreclaimed
 // generations already equals MaxRetainedGenerations, the reload is refused
 // with a *ReloadError of Kind ReloadDrainFull. No in-use generation is ever
 // closed to make room and nothing is built.
 //
 // Build policy mirrors Reloader: a build failure (or a canceled context)
-// leaves the active generation completely untouched.
+// leaves the active generation completely untouched and clears Reloading.
+//
+// Shutdown may land while the build is in flight. Shutdown stays
+// authoritative: on publication the reload notices the closed flag, discards
+// the freshly built generation (closing its plugins), and reports failure
+// without ever having changed the served state.
 //
 // After publication the previous generation is retired. Retirement never
 // blocks waiting for leases: with zero leases it is reclaimed right away;
@@ -369,13 +402,14 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	// Reloads are serialized for the whole build+publish sequence: the
-	// capacity decision and the publication must be atomic, otherwise two
-	// concurrent reloads could both pass the capacity check and overshoot it.
-	// Reading the served generation (Acquire's atomic load) stays lock-free;
-	// only the short lease-pin waits behind an in-progress build.
-	m.mu.Lock()
+	// Serialize whole reloads (capacity check + build + publish must be one
+	// logical sequence) WITHOUT serializing against readers. reloadMu is held
+	// for the whole call; mu is taken only in short critical sections, and the
+	// slow build runs with neither lock affecting readers.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
 
+	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return &ReloadError{
@@ -396,13 +430,17 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 	m.reloading = true
+	m.reloadingSince = time.Now()
+	m.cond.Broadcast()
+	m.mu.Unlock()
 
-	// Build the new world while the old one keeps serving. Manager state
-	// cannot change here because Reload holds mu (and Shutdown takes it too).
+	// Build the new world while the old one keeps serving. This is the slow
+	// phase: it holds no manager lock, so Status/Acquire/Release stay
+	// responsive and the Reloading intermediate state stays observable.
 	next, err := m.build(ctx, cfg)
 	if err != nil {
-		m.reloading = false
-		m.cond.Broadcast()
+		m.mu.Lock()
+		m.clearReloadingLocked()
 		m.mu.Unlock()
 		kind := ReloadBuildFailed
 		reason := "snapshot build failed; previous snapshot remains in service"
@@ -414,8 +452,8 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		return &ReloadError{Kind: kind, Reason: reason, WrapErr: err, OldKept: true}
 	}
 	if next == nil || next.Config == nil {
-		m.reloading = false
-		m.cond.Broadcast()
+		m.mu.Lock()
+		m.clearReloadingLocked()
 		m.mu.Unlock()
 		return &ReloadError{
 			Kind:    ReloadBuildFailed,
@@ -424,18 +462,34 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
+	// Publication: single critical section + single atomic pointer swap.
+	m.mu.Lock()
+	// Shutdown may have run while we were building. It is authoritative: do
+	// NOT resurrect a served generation. Discard the one we just built.
+	if m.closed {
+		m.clearReloadingLocked()
+		m.mu.Unlock()
+		closeErr := ClosePlugins(next.Plugins)
+		return &ReloadError{
+			Kind: ReloadBuildFailed,
+			Reason: "manager shut down while the new generation was being prepared; " +
+				"the built generation was discarded and the served state was not changed",
+			WrapErr: closeErr,
+			OldKept: true,
+		}
+	}
+
 	m.nextID++
 	ng := &generation{id: m.nextID, snap: next, state: GenActive, bornAt: time.Now()}
 	prev := m.active
 	m.active = ng
-	m.reloading = false
+	m.clearReloadingLocked()
 	// Single atomic publication point.
 	m.current.Store(ng)
 	var syncReap *generation
 	if prev != nil {
 		syncReap = m.retireLocked(prev)
 	}
-	m.cond.Broadcast()
 	m.mu.Unlock()
 
 	// A displaced generation with no outstanding leases is reclaimed before
@@ -453,6 +507,14 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 	return nil
+}
+
+// clearReloadingLocked clears the in-progress reload flag under mu and wakes
+// anyone waiting on manager state.
+func (m *Manager) clearReloadingLocked() {
+	m.reloading = false
+	m.reloadingSince = time.Time{}
+	m.cond.Broadcast()
 }
 
 // retainedCountsLocked splits retained generations into stuck vs draining.
@@ -492,7 +554,10 @@ func (m *Manager) retireLocked(g *generation) *generation {
 func (m *Manager) Status() ManagerStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	st := ManagerStatus{Reloading: m.reloading}
+	st := ManagerStatus{
+		Reloading:      m.reloading,
+		ReloadingSince: m.reloadingSince,
+	}
 	if m.active != nil {
 		st.ActiveVersion = m.active.id
 	}
@@ -533,7 +598,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	m.closed = true
-	m.reloading = false
+	m.clearReloadingLocked()
 
 	var toClose []*generation
 	if m.active != nil {

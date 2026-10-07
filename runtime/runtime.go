@@ -28,6 +28,27 @@
 //     release path never blocks on Close (closing is asynchronous); the
 //     reload main path never waits for a slow lease holder.
 //
+// Slow-prepare window (while a reload is still building, not yet published):
+//
+// The potentially slow build runs WITHOUT the bookkeeping lock; only reloads
+// are serialized among themselves (a dedicated reload lock, never held across
+// the build in a way that blocks readers). Therefore, for the entire prepare
+// phase — however slow it is:
+//
+//   - Status returns immediately and honestly reports Reloading=true together
+//     with ReloadingSince (the prepare start time), while ActiveVersion keeps
+//     naming the still-serving old generation. Other reads (ActiveVersion,
+//     CurrentSnapshot, Acquire) stay consistent with that same old generation.
+//   - New work via Acquire returns immediately, pinned to the old generation,
+//     and keeps running normally. Nothing queues behind the in-progress build.
+//   - In-flight work runs to completion and Releases promptly; a slow build
+//     can never stall Acquire/Release/Status for a meaningful time.
+//   - On success the single swap moves new arrivals onto the new generation;
+//     on build failure or context timeout Reloading is cleared and the old
+//     generation is left exactly as it was. If Shutdown lands mid-build, the
+//     completed build is discarded (its plugins closed) instead of resurrecting
+//     a served generation.
+//
 // Reclamation observability (Manager.Status):
 //
 //   - ActiveVersion: the generation currently served to new work.
